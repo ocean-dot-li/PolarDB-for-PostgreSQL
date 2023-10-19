@@ -1962,7 +1962,13 @@ _SPI_prepare_plan(const char *src, SPIPlanPtr plan)
 		 */
 		plansource = CreateCachedPlan(parsetree,
 									  src,
-									  CreateCommandTag(parsetree->stmt));
+									  CreateCommandTag(parsetree->stmt),
+									  /*
+									   * Shared Server, here set polar_on_session_context = false.
+									   * This plansource is belong to backend context, not session context.
+									   */
+									  false,
+									  NULL);
 
 		/*
 		 * Parameter datatypes are driven by parserSetup hook if provided,

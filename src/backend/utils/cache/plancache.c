@@ -154,7 +154,9 @@ InitPlanCache(void)
 CachedPlanSource *
 CreateCachedPlan(RawStmt *raw_parse_tree,
 				 const char *query_string,
-				 const char *commandTag)
+				 const char *commandTag,
+				 bool polar_on_session_context,
+				 const char *stmt_name)
 {
 	CachedPlanSource *plansource;
 	MemoryContext source_context;
@@ -213,6 +215,9 @@ CreateCachedPlan(RawStmt *raw_parse_tree,
 	plansource->total_custom_cost = 0;
 	plansource->num_custom_plans = 0;
 	plansource->planId = 0;
+
+	/* POLAR: record stmt_name */
+	plansource->stmt_name = stmt_name ? pstrdup(stmt_name) : NULL;
 
 	MemoryContextSwitchTo(oldcxt);
 
@@ -1391,9 +1396,19 @@ CopyCachedPlan(CachedPlanSource *plansource)
 		newsource->resultDesc = NULL;
 	newsource->context = source_context;
 
-	querytree_context = AllocSetContextCreate(source_context,
-											  "CachedPlanQuery",
-											  ALLOCSET_START_SMALL_SIZES);
+	newsource->stmt_name = NULL;
+
+	if (plansource->polar_on_session_context)
+		querytree_context = polar_session_alloc_set_context_create(
+												source_context,
+												source_context,
+												"CachedPlanQuery",
+												ALLOCSET_START_SMALL_SIZES);
+	else
+		querytree_context = AllocSetContextCreate(source_context,
+												"CachedPlanQuery",
+												ALLOCSET_START_SMALL_SIZES);
+
 	MemoryContextSwitchTo(querytree_context);
 	newsource->query_list = copyObject(plansource->query_list);
 	newsource->relationOids = copyObject(plansource->relationOids);

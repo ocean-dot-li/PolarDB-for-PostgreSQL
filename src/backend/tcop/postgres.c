@@ -89,8 +89,10 @@
 #include "access/xlog_internal.h"
 #include "libpq/polar_network_stats.h"
 #include "parser/parse_param.h"
+#include "parser/parse_type.h"
 #include "storage/polar_fd.h"
 #include "utils/polar_sql_time_stat.h"
+#include "utils/syscache.h"
 
 /* POLAR px */
 #include "px/px_disp_query.h"
@@ -1319,7 +1321,27 @@ exec_simple_query(const char *query_string)
 	 */
 	if (check_log_statement(parsetree_list) && !(needs_mask && MyProc->issuper))
 	{
-		polar_audit_log.query_string = query_string;
+		StringInfoData processed_query_string;
+		initStringInfo(&processed_query_string);
+		
+		/* POLAR : log search_ptah info */
+		if (polar_enable_log_search_path)
+			appendStringInfo(&processed_query_string, "/*%s*/ ",
+											namespace_search_path);
+
+		/* POLAR: log a simple PREPARED statement info */
+		if (polar_log_prepared_info.params_typename && 
+						polar_enable_log_parameter_type)
+		{
+			appendStringInfo(&processed_query_string, "/*%s*/ %s %s",
+								polar_log_prepared_info.params_typename,
+								query_string,
+								polar_log_prepared_info.source_text);
+		}	
+		else
+			appendStringInfoString(&processed_query_string, query_string);
+
+		polar_audit_log.query_string = processed_query_string.data;
 		if (polar_enable_multi_syslogger)
 		{
 			ErrorData edata;
@@ -1331,18 +1353,28 @@ exec_simple_query(const char *query_string)
 			edata.message = NULL;
 			edata.needs_mask = needs_mask;
 
- 			polar_write_audit_log(&edata, "statement: %s", query_string);
+ 			polar_write_audit_log(&edata, "statement: %s", processed_query_string.data);
 		}
 		else
 		{
 			ereport(LOG,
-					(errmsg("statement: %s", query_string),
+					(errmsg("statement: %s", processed_query_string.data),
 					 errhidestmt(true),
 					 polar_mark_audit_log(true),
 					 polar_mark_needs_mask(needs_mask),
 					 errdetail_execute(parsetree_list)));
 		}
 		was_logged = true;
+
+		/* POLAR: free memory allocated in ErrorContext */
+		if (polar_log_prepared_info.params_typename)
+		{
+			pfree(polar_log_prepared_info.params_typename);
+			pfree(polar_log_prepared_info.source_text);
+			polar_log_prepared_info.params_typename = NULL;
+			polar_log_prepared_info.source_text = NULL;
+		}
+		pfree(processed_query_string.data);
 	}
 	/* POLAR end */
 
@@ -1363,14 +1395,29 @@ exec_simple_query(const char *query_string)
 					 errhidestmt(true)));
 			break;
 		case 2:
-			ereport(LOG,
-					(errmsg("duration: %s ms  statement: %s",
-							msec_str, query_string),
-					 errhidestmt(true),
-					 polar_mark_slow_log(true),   /* POLAR */
-					 polar_mark_needs_mask(needs_mask),
-					 errdetail_execute(parsetree_list)));
-			break;
+			{
+				StringInfoData buf;
+
+				initStringInfo(&buf);
+
+				if (polar_enable_log_search_path)
+					appendStringInfo(&buf, "/*%s*/ ", namespace_search_path);
+
+				ereport(LOG,
+						(errmsg("duration: %s ms  statement: %s%s",
+								msec_str,
+								buf.data ? buf.data : "", 
+								query_string),
+						 errhidestmt(true),
+						 polar_mark_slow_log(true),   /* POLAR */
+						 polar_mark_needs_mask(needs_mask),
+						 errdetail_execute(parsetree_list)));
+
+				if (buf.data)
+					pfree(buf.data);
+
+				break;
+			}
 	}
 
 	if (save_log_statement_stats)
@@ -1509,7 +1556,7 @@ exec_parse_message(const char *query_string,	/* string to execute */
 		 * Create the CachedPlanSource before we do parse analysis, since it
 		 * needs to see the unmodified raw parse tree.
 		 */
-		psrc = CreateCachedPlan(raw_parse_tree, query_string, commandTag);
+		psrc = CreateCachedPlan(raw_parse_tree, query_string, commandTag, POLAR_SS_NOT_DEDICATED() && is_named, stmt_name);
 
 		/*
 		 * Set up a snapshot if parse analysis will need one.
@@ -1569,7 +1616,7 @@ exec_parse_message(const char *query_string,	/* string to execute */
 		/* Empty input string.  This is legal. */
 		raw_parse_tree = NULL;
 		commandTag = NULL;
-		psrc = CreateCachedPlan(raw_parse_tree, query_string, commandTag);
+		psrc = CreateCachedPlan(raw_parse_tree, query_string, commandTag, POLAR_SS_NOT_DEDICATED() && is_named, NULL);
 		querytree_list = NIL;
 	}
 
@@ -1640,14 +1687,28 @@ exec_parse_message(const char *query_string,	/* string to execute */
 					 errhidestmt(true)));
 			break;
 		case 2:
+		{
+			StringInfoData buf;
+
+			initStringInfo(&buf);
+
+			if (polar_enable_log_search_path)
+				appendStringInfo(&buf, "/*%s*/ ", namespace_search_path);
+
 			ereport(LOG,
-					(errmsg("duration: %s ms  parse %s: %s",
+					(errmsg("duration: %s ms  parse %s: %s%s",
 							msec_str,
 							*stmt_name ? stmt_name : "<unnamed>",
+							buf.data ? buf.data : "",
 							query_string),
 					 polar_mark_slow_log(true),   /* POLAR */
 					 errhidestmt(true)));
+			
+			if (buf.data)
+				pfree(buf.data);
+
 			break;
+		}
 	}
 
 	if (save_log_statement_stats)
@@ -2042,17 +2103,31 @@ exec_bind_message(StringInfo input_message)
 					 errhidestmt(true)));
 			break;
 		case 2:
+		{
+			StringInfoData buf;
+
+			initStringInfo(&buf);
+
+			if (polar_enable_log_search_path)
+				appendStringInfo(&buf, "/*%s*/ ", namespace_search_path);
+
 			ereport(LOG,
-					(errmsg("duration: %s ms  bind %s%s%s: %s\nparams: %s",
+					(errmsg("duration: %s ms  bind %s%s%s: %s%s\nparams: %s",
 							msec_str,
 							*stmt_name ? stmt_name : "<unnamed>",
 							*portal_name ? "/" : "",
 							*portal_name ? portal_name : "",
+							buf.data ? buf.data : "",
 							psrc->query_string,
 							params_string ? params_string : ""),
 					 polar_mark_slow_log(true),    /* POLAR */
 					 errhidestmt(true)));
+
+			if (buf.data)
+				pfree(buf.data);
+
 			break;
+		}
 	}
 
 	/* POLAR: free params_string */
@@ -2090,10 +2165,12 @@ exec_execute_message(const char *portal_name, long max_rows)
 
 	/* POLAR */
 	ListCell	*stmt_item;
+	StringInfoData buf;
 	bool		needs_mask = false;
 	bool		to_log = false;
 	int		log_mode = false;
 	char       *params_string = NULL;
+	char 	   *params_typename = NULL;
 
 	/* Adjust destination to tell printtup.c what to do */
 	dest = whereToSendOutput;
@@ -2273,6 +2350,15 @@ exec_execute_message(const char *portal_name, long max_rows)
 	    /* POLAR: get errmsg params string, we must free it in the last */
 		// It needs to malloc and free twice, not so efficiency.
 	    params_string = polar_get_errmsg_params(portalParams);
+	
+		initStringInfo(&buf);
+		if (polar_enable_log_search_path)
+			appendStringInfo(&buf, "/*%s*/ ", namespace_search_path);
+
+		/* POLAR: get params typename, we must free it in the last */
+		if (portalParams && (portalParams->numParams > 0) &&
+								polar_enable_log_parameter_type)
+			params_typename = polar_get_prepared_statement_params_typename(prepStmtName);
 
 		if (polar_enable_multi_syslogger)
 		{
@@ -2295,13 +2381,14 @@ exec_execute_message(const char *portal_name, long max_rows)
 
 				/* POLAR: print audit log*/
 				polar_write_audit_log(&edata,
-								"%s %s%s%s: %s",
+								"%s %s%s%s: %s%s",
 								execute_is_fetch ?
 								"execute fetch from" :
 								"execute",
 								prepStmtName,
 								*portal_name ? "/" : "",
 								*portal_name ? portal_name : "",
+								buf.data ? buf.data : "",
 								audit_sql_log ? audit_sql_log : sourceText);
 
 				/* POLAR: free audit_sql_log */
@@ -2310,28 +2397,38 @@ exec_execute_message(const char *portal_name, long max_rows)
 			}
 			else
 			{
+				/* POLAR: only log parameters typename when not binding value */
+				if (params_typename)
+					appendStringInfo(&buf, "/*%s*/ ", params_typename);
+
 				polar_write_audit_log(&edata,
-								"%s %s%s%s: %s\nparams: %s",
+								"%s %s%s%s: %s%s\nparams: %s",
 								execute_is_fetch ?
 								"execute fetch from" :
 								"execute",
 								prepStmtName,
 								*portal_name ? "/" : "",
 								*portal_name ? portal_name : "",
+								buf.data ? buf.data : "",
 								sourceText,
 								params_string ? params_string : "");
 			}
 		}
 		else
 		{
+			/* POLAR: only log parameters typename when not binding value */
+			if (params_typename)
+				appendStringInfo(&buf, "/*%s*/ ", params_typename);
+
 			ereport(LOG,
-					(errmsg("%s %s%s%s: %s\nparams: %s",
+					(errmsg("%s %s%s%s: %s%s\nparams: %s",
 							execute_is_fetch ?
 							_("execute fetch from") :
 							_("execute"),
 							prepStmtName,
 							*portal_name ? "/" : "",
 							*portal_name ? portal_name : "",
+							buf.data ? buf.data : "",
 							sourceText,
 							params_string ? params_string : ""),
 					 errhidestmt(true),
@@ -2339,6 +2436,8 @@ exec_execute_message(const char *portal_name, long max_rows)
 					 polar_mark_needs_mask(needs_mask)));
 		}
 	    /* POLAR end */
+		if (params_typename)
+			pfree(params_typename);
 
 		was_logged = true;
 	}
@@ -2361,7 +2460,7 @@ exec_execute_message(const char *portal_name, long max_rows)
   			break;
   		case 2:
 			ereport(LOG,
-					(errmsg("duration: %s ms  %s %s%s%s: %s\nparams: %s",
+					(errmsg("duration: %s ms  %s %s%s%s: %s%s\nparams: %s",
 							msec_str,
 							execute_is_fetch ?
 							_("execute fetch from") :
@@ -2369,6 +2468,7 @@ exec_execute_message(const char *portal_name, long max_rows)
 							prepStmtName,
 							*portal_name ? "/" : "",
 							*portal_name ? portal_name : "",
+							buf.data ? buf.data : "",
 							sourceText,
 							params_string ? params_string : ""),
 					errhidestmt(true),
@@ -2381,6 +2481,9 @@ exec_execute_message(const char *portal_name, long max_rows)
   	if (params_string)
   		pfree(params_string);
   	/* POLAR end */
+
+	if (buf.data)
+		pfree(buf.data);
 
   	if (save_log_statement_stats)
   		ShowUsage("EXECUTE MESSAGE STATISTICS");
@@ -5520,3 +5623,56 @@ polar_process_client_readwrite_cancel_interrupt(void)
 		ProcDiePending = true;
 }
 /* POLAR end */
+
+/*
+ * POLAR: get parameters typename of prepared statements by using stmt name
+ */
+char *
+polar_get_prepared_statement_params_typename(const char *stmt_name)
+{
+	int paramno;
+	PreparedStatement  *pstmt;
+	CachedPlanSource   *psrc;
+	StringInfoData 		result;
+
+	/* named stmt */
+	if (strcmp(stmt_name, "<unnamed>"))
+	{
+		pstmt = FetchPreparedStatement(stmt_name, false);
+
+		/* Assert pstmt is not NULL */
+		if (!pstmt)
+			return NULL;
+
+		psrc = pstmt->plansource;
+	}
+	/* unnamed stmt */
+	else
+	{
+		/* special-case the unnamed statement */
+		psrc = unnamed_stmt_psrc;
+	}
+
+	/* invalid case, just return NULL */
+	if (!psrc || psrc->num_params <= 0)
+		return NULL;
+
+	/* initialize result and pattern string */
+	initStringInfo(&result);
+
+	/* result is filled with <stmt_name>,<p1typename>,... */
+	appendStringInfoString(&result, psrc->stmt_name);
+	for (paramno = 0; paramno < psrc->num_params; paramno++)
+	{
+		Type  type;
+		char *typename;
+
+		type = typeidType(psrc->param_types[paramno]);
+		typename = typeTypeName(type);
+		ReleaseSysCache(type);
+
+		appendStringInfo(&result, ",%s", typename);
+	}
+
+	return result.data;
+}

@@ -117,6 +117,12 @@ typedef struct CachedPlanSource
 	double		total_custom_cost;	/* total cost of custom plans so far */
 	int			num_custom_plans;	/* number of plans included in total */
 	Oid 		planId;
+
+	/* POLAR: Shared Server */
+	bool		polar_on_session_context;
+
+	/* POLAR: The stmt_name who created this plansource*/
+	char		*stmt_name;
 } CachedPlanSource;
 
 /*
@@ -150,8 +156,10 @@ extern void InitPlanCache(void);
 extern void ResetPlanCache(void);
 
 extern CachedPlanSource *CreateCachedPlan(struct RawStmt *raw_parse_tree,
-				 const char *query_string,
-				 const char *commandTag);
+										  const char *query_string,
+										  const char *commandTag,
+										  bool polar_on_session_context,
+										  const char *stmt_name);
 extern CachedPlanSource *CreateOneShotCachedPlan(struct RawStmt *raw_parse_tree,
 						const char *query_string,
 						const char *commandTag);
